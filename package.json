@@ -1,0 +1,12 @@
+{
+  "name": "my-3d-game",
+  "version": "1.0.0",
+  "description": "Простая 3D-игра от первого лица: сервер на Node.js без внешних библиотек",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
