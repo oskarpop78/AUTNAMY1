@@ -104,6 +104,7 @@ const socketById = new Map(); // id игрока -> сокет
 
 const game = createGame({
   startMoney: Number(process.env.START_MONEY) || undefined, // для тренировки: start-training.bat
+  mode: (process.env.MODE || '').toLowerCase() === 'evade' ? 'evade' : 'classic',   // MODE=evade включает режим «Побег»
   bots: Number(process.env.BOTS) || 0,                      // сколько ботов-противников
   botLevel: Number(process.env.BOT_LEVEL) || 2,             // сложность ботов: 1 лёгкие, 2 средние, 3 сложные
   // сообщение одному игроку
@@ -188,6 +189,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('=== Сервер игры AUTNAMY запущен ===');
   console.log(`Карта: ${world.MAP.name}.  Ботов: ${Number(process.env.BOTS) || 0}`);
+  console.log(`Режим: ${(process.env.MODE || '').toLowerCase() === 'evade' ? 'ПОБЕГ (Evade)' : 'обычный'}`);
   console.log(`Ты:                    http://localhost:${PORT}`);
   for (const list of Object.values(os.networkInterfaces())) {
     for (const net of list) {
