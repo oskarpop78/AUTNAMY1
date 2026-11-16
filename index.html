@@ -159,8 +159,10 @@ uniform vec3 uPos;
 uniform vec3 uScale;
 uniform float uYaw;
 uniform vec2 uRot;
+uniform mat4 uLVP;
 varying vec3 vNormal;
 varying vec3 vWorld;
+varying vec4 vLP;
 void main() {
   vec3 p = aPos * uScale;
   vec3 n0 = aNormal;
@@ -176,6 +178,7 @@ void main() {
   vNormal = vec3(c * n0.x + s * n0.z, n0.y, -s * n0.x + c * n0.z);
   vWorld = r + uPos;
   gl_Position = uVP * vec4(vWorld, 1.0);
+  vLP = uLVP * vec4(vWorld + normalize(vNormal) * 0.06, 1.0);
 }`;
 
 const FS = `
@@ -199,26 +202,77 @@ uniform sampler2D uT2;
 uniform sampler2D uT3;
 uniform sampler2D uT4;
 uniform sampler2D uT5;
+uniform sampler2D uSM;
+uniform float uShadowOn;
+uniform float uDepthOnly;
+uniform float uSMsize;
+uniform vec3 uSun;
 varying vec3 vNormal;
 varying vec3 vWorld;
+varying vec4 vLP;
 
-vec3 matTex(vec3 w, vec3 n, float m) {
+vec3 texM(vec2 uv, float m) {
+  if (m < 0.5) return texture2D(uT0, uv).rgb;
+  if (m < 1.5) return texture2D(uT1, uv).rgb;
+  if (m < 2.5) return texture2D(uT2, uv).rgb;
+  if (m < 3.5) return texture2D(uT3, uv).rgb;
+  if (m > 4.5) return texture2D(uT5, uv).rgb;
+  return texture2D(uT4, uv).rgb;
+}
+float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
+
+// рельеф из яркости текстуры + мелкая «деталь» поверх (вблизи)
+vec3 surface(vec3 w, vec3 n, float m, float dist, out vec3 nb, out float detail) {
   vec3 a = abs(n);
-  vec2 uv;
+  vec2 uvw; vec3 T; vec3 B;
+  if (a.y > 0.5) { uvw = w.xz; T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 0.0, 1.0); }
+  else if (a.x > 0.5) { uvw = vec2(w.z, -w.y); T = vec3(0.0, 0.0, 1.0); B = vec3(0.0, -1.0, 0.0); }
+  else { uvw = vec2(w.x, -w.y); T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, -1.0, 0.0); }
+  vec2 uv; float bump = 4.0;
   if (m > 2.5 && m < 3.5) {
     vec3 l = (w - uCPos) / uCScale + 0.5;
     if (a.y > 0.5) uv = l.xz; else if (a.x > 0.5) uv = vec2(l.z, 1.0 - l.y); else uv = vec2(l.x, 1.0 - l.y);
-    return texture2D(uT3, uv).rgb;
-  }
-  if (a.y > 0.5) uv = w.xz; else if (a.x > 0.5) uv = vec2(w.z, -w.y); else uv = vec2(w.x, -w.y);
-  if (m < 0.5) return texture2D(uT0, uv / 6.0).rgb;
-  if (m < 1.5) return texture2D(uT1, uv / 2.5).rgb;
-  if (m < 2.5) return texture2D(uT2, uv / 3.0).rgb;
-  if (m > 4.5) return texture2D(uT5, uv / 4.0).rgb;
-  return texture2D(uT4, uv / 2.5).rgb;
+    bump = 5.0;
+  } else if (m < 0.5) { uv = uvw / 6.0; bump = 1.1; }
+  else if (m < 1.5) { uv = uvw / 2.5; bump = 6.0; }
+  else if (m < 2.5) { uv = uvw / 3.0; bump = 5.0; }
+  else if (m > 4.5) { uv = uvw / 4.0; bump = 0.7; }
+  else { uv = uvw / 2.5; bump = 4.5; }
+  vec3 c0 = texM(uv, m);
+  float e = 1.0 / 256.0;
+  float h0 = lum(c0);
+  float hx = lum(texM(uv + vec2(e, 0.0), m));
+  float hy = lum(texM(uv + vec2(0.0, e), m));
+  float near = 1.0 - smoothstep(14.0, 55.0, dist);
+  vec3 g = (hx - h0) * T + (hy - h0) * B;
+  nb = normalize(n - g * bump * near * 4.0);
+  // мелкая добавочная фактура, чтобы вблизи не было «мыла»
+  float dl = lum(texM(uv * 5.3 + vec2(0.37, 0.61), m));
+  detail = mix(1.0, 0.55 + 0.95 * dl, 0.55 * (1.0 - smoothstep(10.0, 38.0, dist)));
+  return c0;
 }
 
+float shadowAt(float ndl) {
+  if (uShadowOn < 0.5) return 1.0;
+  vec3 p = vLP.xyz / vLP.w * 0.5 + 0.5;
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;
+  float bias = 0.0012 + 0.0025 * (1.0 - clamp(ndl, 0.0, 1.0));
+  float s = 0.0;
+  for (int i = -1; i <= 1; i++) {
+    for (int j = -1; j <= 1; j++) {
+      float d = texture2D(uSM, p.xy + vec2(float(i), float(j)) * uSMsize * 1.4).r;
+      s += (p.z - bias <= d) ? 1.0 : 0.0;
+    }
+  }
+  s /= 9.0;
+  vec2 q = abs(p.xy * 2.0 - 1.0);
+  return mix(s, 1.0, smoothstep(0.8, 1.0, max(q.x, q.y)));
+}
+
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+
 void main() {
+  if (uDepthOnly > 0.5) { gl_FragColor = vec4(1.0); return; }
   if (uMat > 8.5) {
     vec3 l = (vWorld - uCPos) / uCScale;
     vec2 q;
@@ -242,30 +296,46 @@ void main() {
   vec3 n = normalize(vNormal);
   if (uUnlit > 0.5) { gl_FragColor = vec4(uColor, uAlpha); return; }
   vec3 base = uColor;
+  vec3 nb = n;
   float spec = 0.35;
   float shin = 36.0;
   float ao = 1.0;
+  float env = 0.05;
+  float dist = length(vWorld - uCam);
   if (uMat > -0.5) {
-    base *= matTex(vWorld, n, uMat) * 1.12;
-    spec = 0.04; shin = 12.0;
-    if (uMat > 3.5 && uMat < 4.5) { spec = 0.45; shin = 40.0; }
-    if (uMat > 0.5 && n.y < 0.5) ao = mix(0.5, 1.0, smoothstep(0.0, 1.6, vWorld.y));
+    float detail = 1.0;
+    vec3 tc = surface(vWorld, n, uMat, dist, nb, detail);
+    base *= tc * detail * 1.12;
+    if (uMat > 4.5) base *= vec3(0.74, 0.76, 0.66);
+    spec = 0.05; shin = 14.0; env = 0.06;
+    if (uMat > 3.5 && uMat < 4.5) { spec = 0.55; shin = 48.0; env = 0.55; }
+    if (uMat > 2.5 && uMat < 3.5) { spec = 0.03; shin = 8.0; env = 0.02; }
+    if (uMat > 4.5) { spec = 0.02; shin = 6.0; env = 0.0; }
+    if (uMat > 0.5 && n.y < 0.5) ao = mix(0.45, 1.0, smoothstep(0.0, 1.8, vWorld.y));
   }
-  vec3 L = normalize(vec3(0.55, 0.75, 0.35));
+  vec3 L = normalize(uSun);
   vec3 V = normalize(uCam - vWorld);
-  float ndl = dot(n, L);
-  float diff = max(ndl, 0.0);
+  float ndlG = dot(n, L);
+  float sh = shadowAt(ndlG);
+  float diff = max(dot(nb, L), 0.0) * smoothstep(-0.02, 0.12, ndlG);
   vec3 alb = pow(base, vec3(2.2));
   vec3 skyL = pow(uFog, vec3(2.2));
-  vec3 amb = mix(vec3(0.16, 0.12, 0.09), skyL * 0.75, n.y * 0.5 + 0.5);
-  vec3 sun = vec3(1.0, 0.88, 0.7) * 1.35;
-  vec3 lit = alb * (amb * ao + sun * diff * (0.5 + 0.5 * ao));
+  vec3 gnd = vec3(0.24, 0.17, 0.11);
+  vec3 amb = mix(gnd, skyL * 0.55 + vec3(0.05, 0.05, 0.06), nb.y * 0.5 + 0.5);
+  vec3 sun = vec3(1.0, 0.86, 0.66) * 1.35;
+  vec3 lit = alb * (amb * ao * (0.8 + 0.2 * sh) + sun * diff * sh * (0.55 + 0.45 * ao));
   vec3 H = normalize(L + V);
-  lit += sun * spec * pow(max(dot(n, H), 0.0), shin) * step(0.0, ndl);
-  lit = lit / (1.0 + lit * 0.6) * 1.35;
-  vec3 col = pow(lit, vec3(1.0 / 2.2));
-  float f = smoothstep(25.0, 110.0, length(vWorld - uCam));
-  gl_FragColor = vec4(mix(col, uFog, f), uAlpha);
+  lit += sun * spec * pow(max(dot(nb, H), 0.0), shin) * step(0.0, ndlG) * sh;
+  // отражение неба (металл блестит сильнее; у всех чуть-чуть по Френелю)
+  vec3 R = reflect(-V, nb);
+  vec3 envc = mix(gnd * 0.8, skyL * 1.1, smoothstep(-0.25, 0.45, R.y));
+  float fres = 0.04 + 0.96 * pow(1.0 - max(dot(nb, V), 0.0), 5.0);
+  lit += envc * fres * env * (0.4 + 0.6 * ao) * (0.3 + 0.7 * sh);
+  vec3 col = pow(aces(lit * 0.85), vec3(1.0 / 2.2));
+  col = mix(vec3(lum(col)), col, 1.12);                      // чуть насыщеннее
+  vec3 fogc = mix(uFog, vec3(1.0, 0.86, 0.64), pow(max(dot(-V, L), 0.0), 6.0) * 0.35);
+  float f = smoothstep(30.0, 125.0, dist);
+  gl_FragColor = vec4(mix(col, fogc, f), uAlpha);
 }`;
 
 function compile(type, src) {
@@ -289,6 +359,7 @@ const U = {
   vp: loc('uVP'), pos: loc('uPos'), scale: loc('uScale'), yaw: loc('uYaw'), rot: loc('uRot'),
   color: loc('uColor'), cam: loc('uCam'), fog: loc('uFog'), checker: loc('uChecker'), unlit: loc('uUnlit'), alpha: loc('uAlpha'),
   mat: loc('uMat'), cpos: loc('uCPos'), cscale: loc('uCScale'),
+  lvp: loc('uLVP'), sm: loc('uSM'), smsize: loc('uSMsize'), shadowOn: loc('uShadowOn'), depthOnly: loc('uDepthOnly'), sun: loc('uSun'),
 };
 
 // Куб: 6 граней по 4 вершины (позиция + нормаль)
@@ -384,7 +455,7 @@ function makeTexture(unit, fn) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
   const an = gl.getExtension('EXT_texture_filter_anisotropic');
-  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
   gl.uniform1i(gl.getUniformLocation(prog, 'uT' + unit), unit);
 }
 const dist2 = (x, y, cx, cy) => { let dx = Math.abs(x - cx); let dy = Math.abs(y - cy); if (dx > TS / 2) dx = TS - dx; if (dy > TS / 2) dy = TS - dy; return Math.hypot(dx, dy); };
@@ -513,6 +584,45 @@ const dist2 = (x, y, cx, cy) => { let dx = Math.abs(x - cx); let dy = Math.abs(y
   }
   gl.activeTexture(gl.TEXTURE0);
 })();
+
+// ---- настоящие тени от солнца: карта глубины ----
+const SUN = (() => { const v = [0.55, 0.75, 0.35]; const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; })();
+const SM = { ok: false, size: 2048, fb: null, tex: null, half: 38 };
+(function initShadow() {
+  try {
+    const ext = gl.getExtension('WEBGL_depth_texture');
+    if (!ext) return;
+    const touch = (navigator.maxTouchPoints || 0) > 0;
+    SM.size = Math.min(touch ? 1024 : 2048, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const size = SM.size;
+    gl.activeTexture(gl.TEXTURE6);
+    const dt = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, dt);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT, size, size, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, dt, 0);
+    const rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA4, size, size);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb);
+    const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (st !== gl.FRAMEBUFFER_COMPLETE) { gl.activeTexture(gl.TEXTURE0); return; }
+    SM.fb = fb; SM.tex = dt; SM.ok = true;
+    gl.uniform1i(U.sm, 6);
+    gl.uniform1f(U.smsize, 1 / size);
+    gl.uniform3fv(U.sun, SUN);
+    gl.uniform1f(U.shadowOn, 0);
+    gl.uniform1f(U.depthOnly, 0);
+    gl.activeTexture(gl.TEXTURE0);
+  } catch (e) { SM.ok = false; }
+})();
+gl.uniform3fv(U.sun, SUN);
 
 // ---- небо: градиент, солнце и облака, считается на видеокарте ----
 const SKY_VS = `
@@ -686,9 +796,14 @@ let shop = [];
 let chars = {};
 const CHAR_ORDER = ['soldier', 'tank', 'ghost', 'medic', 'ninja'];
 const CHAR_COLORS = { soldier: '#58a04a', tank: '#b03a3a', ghost: '#a070ff', medic: '#f2f2f2', ninja: '#303038' };
-const cats = () => [{ name: 'Персонажи', chars: true }, ...shop];
+const cats = () => (MODE === 'evade' ? [{ name: 'Персонажи', chars: true }] : [{ name: 'Персонажи', chars: true }, ...shop]);
 let weaponInfo = {};
 let serverPlayers = [];
+let MODE = 'classic';
+let serverChasers = [];
+const shownCh = new Map();
+let nearChaser = 999;
+let lastBeat = 0;
 let serverNades = [];
 let serverSmokes = [];
 let serverFires = [];
@@ -959,7 +1074,8 @@ socket.onmessage = (event) => {
   const msg = JSON.parse(event.data);
   switch (msg.type) {
     case 'hello':
-      myId = msg.id; bounds = msg.bounds; eye = msg.eye;
+      myId = msg.id; bounds = msg.bounds; eye = msg.eye; MODE = msg.mode || 'classic';
+      if (MODE === 'evade') { for (const id of ['money', 'vitals', 'ammo', 'nades', 'crosshair']) { const n = document.getElementById(id); if (n) n.style.display = 'none'; } }
       boxes = msg.boxes.map((b) => ({ ...b, rgb: hex(b.color), mat: pickMat(b) }));
       shop = msg.shop; chars = msg.chars || {}; weaponInfo = msg.weapons;
       if (msg.map) {
@@ -980,11 +1096,22 @@ socket.onmessage = (event) => {
       }
       break;
     case 'phase':
-      if (msg.phase === 'buy') { endText = ''; el.banner.textContent = 'Закупка: нажми B'; setTimeout(() => { if (el.banner.textContent === 'Закупка: нажми B') el.banner.textContent = ''; }, 3500); }
-      if (msg.phase === 'live') { closeBuy(); el.banner.textContent = 'Бой!'; setTimeout(() => { if (el.banner.textContent === 'Бой!') el.banner.textContent = ''; }, 1500); }
+      if (msg.phase === 'buy' && MODE === 'evade') { endText = ''; el.banner.textContent = 'Приготовьтесь! Скоро появится преследователь — БЕГИТЕ и держитесь вместе'; setTimeout(() => { if (/Приготовьтесь/.test(el.banner.textContent)) el.banner.textContent = ''; }, 5000); }
+      else if (msg.phase === 'buy') { endText = ''; el.banner.textContent = 'Закупка: нажми B'; setTimeout(() => { if (el.banner.textContent === 'Закупка: нажми B') el.banner.textContent = ''; }, 3500); }
+      if (msg.phase === 'live') { closeBuy(); el.banner.textContent = MODE === 'evade' ? 'ВЫЖИВАЙ!' : 'Бой!'; setTimeout(() => { if (/^(Бой!|ВЫЖИВАЙ!)$/.test(el.banner.textContent)) el.banner.textContent = ''; }, 1500); }
       beepSound();
       break;
     case 'roundEnd': endText = msg.text; el.banner.textContent = msg.text; break;
+    case 'caught':
+      if (msg.id === myId) { el.dmg.classList.add('show'); setTimeout(() => el.dmg.classList.remove('show'), 400); hurtSound(); noise({ dur: 0.5, type: 'lowpass', f: 400, vol: 0.5 }); tone(90, 0.7, 0.3, 'sawtooth'); toast('Тебя поймали! Жди, пока тебя поднимут'); }
+      else toast(nameOf(msg.id) + ' пойман! Подбеги и подними (стой рядом)');
+      break;
+    case 'revived':
+      tone(520, 0.15, 0.2, 'triangle'); tone(780, 0.3, 0.2, 'triangle', 0.12);
+      toast(msg.id === myId ? 'Тебя подняли! Беги!' : nameOf(msg.id) + ' поднят');
+      break;
+    case 'lost': if (msg.id === myId) toast('Ты выбыл до конца раунда'); else toast(nameOf(msg.id) + ' выбыл'); break;
+    case 'chaser': tone(70, 1.2, 0.35, 'sawtooth'); tone(74, 1.2, 0.3, 'square'); toast('⚠ Преследователь появился!'); break;
     case 'shot': onShot(msg); break;
     case 'throw': onThrow(msg); break;
     case 'slash': onSlash(msg); break;
@@ -1013,6 +1140,7 @@ function onState(msg) {
   serverNades = msg.nades || [];
   serverSmokes = msg.smokes || [];
   serverFires = msg.fires || [];
+  serverChasers = msg.chasers || [];
   for (const p of msg.players) if (p.name) names.set(p.id, 'Бот ' + p.name);
   const wasBlind = you ? you.blind : 0;
   you = msg.you;
@@ -1715,7 +1843,7 @@ function drawAnim(id, t) {
 }
 
 function drawViewmodel(proj, now, speedU) {
-  if (!you || !you.alive || isScoped()) return;
+  if (!you || !you.alive || isScoped() || MODE === 'evade') return;
   const id = you.w;
   const m = VM[id] || VM.pistol;
   gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -1884,7 +2012,7 @@ function updateShown(dt) {
     s.y += (p.y - s.y) * tt;
     s.z += (p.z - s.z) * tt;
     s.yaw = angleLerp(s.yaw, p.yaw, t);
-    s.color = p.color; s.w = p.w; s.alive = p.alive; s.hp = p.hp; s.bot = p.bot; s.ai = p.ai; s.spd = p.spd; s.pitch = p.pitch; s.ch = p.ch;
+    s.color = p.color; s.w = p.w; s.alive = p.alive; s.hp = p.hp; s.bot = p.bot; s.ai = p.ai; s.spd = p.spd; s.pitch = p.pitch; s.ch = p.ch; s.dn = p.dn; s.rv = p.rv;
     s.phase = (s.phase || 0) + dt * (p.spd || 0) * 1.0;
     // шаги: слышно, когда кто-то бежит по земле
     const grounded = Math.abs(p.y - (s.lastY === undefined ? p.y : s.lastY)) < 0.02;
@@ -1907,6 +2035,65 @@ function updateShown(dt) {
     }
   }
   me = shown.get(myId) || null;
+  // преследователи
+  const seenC = new Set();
+  nearChaser = 999;
+  for (const c of serverChasers) {
+    seenC.add(c.id);
+    let s = shownCh.get(c.id);
+    if (!s) { s = { ...c, phase: 0 }; shownCh.set(c.id, s); }
+    const tc = 1 - Math.exp(-dt * 14);
+    s.x += (c.x - s.x) * tc; s.y += (c.y - s.y) * tc; s.z += (c.z - s.z) * tc;
+    s.yaw = angleLerp(s.yaw, c.yaw, tc);
+    s.spd = c.spd; s.st = c.st;
+    s.phase += dt * (c.spd || 0) * 1.0;
+    if (me) nearChaser = Math.min(nearChaser, Math.hypot(s.x - me.x, s.z - me.z));
+  }
+  for (const id of [...shownCh.keys()]) if (!seenC.has(id)) shownCh.delete(id);
+}
+
+function ortho(l, r, b, t, n, f) {
+  const o = new Float32Array(16);
+  o[0] = 2 / (r - l); o[5] = 2 / (t - b); o[10] = -2 / (f - n);
+  o[12] = -(r + l) / (r - l); o[13] = -(t + b) / (t - b); o[14] = -(f + n) / (f - n); o[15] = 1;
+  return o;
+}
+
+// рисуем сцену с точки зрения солнца в карту глубины (только глубина)
+function renderShadowMap(px, py, pz, fx, fz) {
+  if (!SM.ok) return;
+  const R = SM.half, size = SM.size;
+  const ts = (2 * R) / size;
+  const l0 = lookAt([SUN[0] * 90, SUN[1] * 90, SUN[2] * 90], [0, 0, 0], [0, 1, 0]);
+  const rx = [l0[0], l0[4], l0[8]], ux = [l0[1], l0[5], l0[9]];
+  let c = [px + fx * R * 0.35, 1.5, pz + fz * R * 0.35];
+  const dr = c[0] * rx[0] + c[1] * rx[1] + c[2] * rx[2];
+  const du = c[0] * ux[0] + c[1] * ux[1] + c[2] * ux[2];
+  const sr = dr - Math.floor(dr / ts) * ts, su = du - Math.floor(du / ts) * ts;
+  c = [c[0] - rx[0] * sr - ux[0] * su, c[1] - rx[1] * sr - ux[1] * su, c[2] - rx[2] * sr - ux[2] * su];
+  const lv = lookAt([c[0] + SUN[0] * 90, c[1] + SUN[1] * 90, c[2] + SUN[2] * 90], c, [0, 1, 0]);
+  const lvp = multiply(ortho(-R, R, -R, R, 1, 190), lv);
+
+  gl.activeTexture(gl.TEXTURE6);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, SM.fb);
+  gl.viewport(0, 0, size, size);
+  gl.colorMask(false, false, false, false);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.cullFace(gl.FRONT);
+  gl.uniform1f(U.depthOnly, 1);
+  gl.uniform1f(U.shadowOn, 0);
+  gl.uniformMatrix4fv(U.vp, false, lvp);
+  drawWorld();
+  for (const p of shown.values()) if (p.alive) drawPlayer(p);
+  gl.cullFace(gl.BACK);
+  gl.uniform1f(U.depthOnly, 0);
+  gl.colorMask(true, true, true, true);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.bindTexture(gl.TEXTURE_2D, SM.tex);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniformMatrix4fv(U.lvp, false, lvp);
 }
 
 function drawWorld() {
@@ -1956,6 +2143,40 @@ function body(p, lx, ly, lz, sx, sy, sz, color, pitch, unlit) {
   drawBox(p.x + m[0], p.y + m[1], p.z + m[2], sx, sy, sz, p.yaw, color, false, unlit || false, pitch || 0, 0);
 }
 
+function drawChaser(c, now) {
+  const dark = [0.05, 0.05, 0.07], mid = [0.12, 0.1, 0.13];
+  const stunned = c.st > 0;
+  const P = { x: c.x, y: c.y, z: c.z, yaw: c.yaw };
+  const amp = stunned ? 0 : 0.85;
+  for (const side of [-1, 1]) {
+    const sw = Math.sin(c.phase * 1.2) * amp * side;
+    limb(P, [side * 0.22, 1.35, 0], [side * 0.22, 1.35 - 1.25 * Math.cos(sw), -1.25 * Math.sin(sw)], 0.3, 0.32, dark);
+  }
+  body(P, 0, 1.95, 0, 0.9, 1.1, 0.5, mid);
+  body(P, 0, 2.7, -0.02, 0.5, 0.5, 0.5, dark);
+  for (const side of [-1, 1]) {
+    const reach = stunned ? 0.2 : 1.0;
+    limb(P, [side * 0.58, 2.35, 0], [side * 0.62, 1.55, -reach], 0.22, 0.22, dark);
+  }
+  // светящиеся глаза
+  const pulse = 0.7 + 0.3 * Math.sin(now / 120);
+  const eyeC = stunned ? [0.9, 0.9, 0.2] : [1, 0.1 * pulse, 0.05];
+  for (const side of [-1, 1]) body(P, side * 0.13, 2.76, -0.27, 0.12, 0.07, 0.04, eyeC, 0, true);
+  drawShadow(c.x, c.y, c.z, 0.9);
+}
+function drawDowned(p, now) {
+  const SK = SKINS[p.ch] || SKINS.soldier;
+  const m = yawRot(0, 0.2, 0, p.yaw);
+  const x = p.x, z = p.z, y = p.y;
+  drawBox(x, y + 0.2, z, 0.5, 0.3, 1.0, p.yaw, SK.shirt, false, false, 0, 0);
+  const h = yawRot(0, 0.2, -0.75, p.yaw);
+  drawBox(x + h[0], y + 0.22, z + h[2], 0.32, 0.32, 0.32, p.yaw, SK.skin, false, false, 0, 0);
+  const l = yawRot(0, 0.15, 0.85, p.yaw);
+  drawBox(x + l[0], y + 0.15, z + l[2], 0.35, 0.25, 0.8, p.yaw, SK.pants, false, false, 0, 0);
+  // красное кольцо вокруг упавшего, зелёное при поднятии
+  const r = p.rv > 0 ? [0.2, 1, 0.3] : [1, 0.15 + 0.1 * Math.sin(now / 150), 0.1];
+  drawBox(x, y + 0.04, z, 1.8, 0.02, 1.8, 0, r, false, true, 0, 0);
+}
 function drawPlayer(p) {
   const c = hex(p.color);
   const dummy = !!p.bot;
@@ -2025,6 +2246,7 @@ function drawPlayer(p) {
   }
 
   // оружие и руки
+  if (MODE === 'evade') return;
   const id = p.w;
   const m = VM[id] || VM.pistol;
   const hold = (id === 'knife' || (weaponInfo[id] && weaponInfo[id].nade));
@@ -2178,7 +2400,7 @@ function updateLabels(vp, cam) {
     const cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
     const dist = Math.hypot(x - cam[0], y - cam[1], z - cam[2]);
     if (!p.alive || cw <= 0.1 || dist > 45 || !seen(cam, x, p.y + 1.6, z)) { l.style.display = 'none'; continue; }
-    const text = p.bot || p.ai ? `${nameOf(id)} · ${p.hp}` : nameOf(id);
+    const text = MODE === 'evade' ? (p.dn ? `⛑ ПОДНИМИ: ${nameOf(id)}` : nameOf(id)) : p.bot || p.ai ? `${nameOf(id)} · ${p.hp}` : nameOf(id);
     if (l.textContent !== text) l.textContent = text;
     l.style.display = 'block';
     l.style.left = ((cx / cw) * 0.5 + 0.5) * w + 'px';
@@ -2198,6 +2420,7 @@ function updateHud() {
   const botsOn = players.length - humansOnline;
   setText('hud', el.hud, `Карта: ${mapName} · Игроков онлайн: ${humansOnline}${botsOn ? ` + ботов: ${botsOn}` : ''}   (ты — игрок ${myId})`);
   if (!you) return;
+  if (MODE === 'evade') { updateHudEvade(players); return; }
   setText('money', el.money, `$${you.money}`);
 
   const left = Math.max(0, roundInfo.left - (performance.now() - roundInfo.at));
@@ -2265,6 +2488,44 @@ function updateHud() {
   }
 }
 
+function updateHudEvade(players) {
+  const left = Math.max(0, roundInfo.left - (performance.now() - roundInfo.at));
+  const sec = Math.ceil(left / 1000);
+  const humans = serverPlayers.filter((p) => !p.bot && !p.ai);
+  const free = humans.filter((p) => p.alive && !p.dn).length;
+  const down = humans.filter((p) => p.alive && p.dn).length;
+  const phaseText = roundInfo.phase === 'buy' ? 'Подготовка (B — персонаж)' : roundInfo.phase === 'live' ? 'Выживи!' : (endText || 'Раунд окончен');
+  setHtml('round', el.round, `<div class="t">${roundInfo.phase === 'end' ? '' : fmt(sec)}</div><div class="s">Раунд ${roundInfo.n} · ${phaseText}<br>Свободны: ${free} · Лежат: ${down}</div>`);
+  const ch = chars[you.ch];
+  if (ch) {
+    const state = you.abOn ? 'on' : you.abLeft > 0 ? '' : 'rdy';
+    const txt = you.abOn ? `${ch.ab}: действует!` : you.abLeft > 0 ? `${ch.ab}: ${you.abLeft} с` : `${ch.ab}: готово`;
+    setHtml('ability', el.ability, `<b>E</b>${ch.name} · ${txt}`);
+    el.ability.className = 'abs ' + state;
+  }
+  const spd = me ? me.spd : 0;
+  setText('speed', el.speed, you.alive && !you.dn ? `Скорость: ${spd.toFixed(1)}` : '');
+  let msg = '';
+  if (!you.alive) msg = roundInfo.phase === 'end' ? '' : 'Ты выбыл. Смотри и жди следующего раунда';
+  else if (you.dn) msg = `ТЕБЯ ПОЙМАЛИ<br><small>Жди, пока друг тебя поднимет · ${Math.ceil(you.bleed || 0)} с</small>` + (you.rv > 0 ? `<div class="vbar" style="width:240px;margin:6px auto"><i style="width:${Math.round(you.rv * 100)}%;background:#4aee66"></i></div>` : '');
+  else {
+    const dn = serverPlayers.find((p) => p.id !== myId && p.dn && p.alive && me && Math.hypot(p.x - me.x, p.z - me.z) < 2.6);
+    if (dn) msg = `Поднимаю ${nameOf(dn.id)}… стой рядом`;
+    else if (you.inv > 0) msg = 'Неуязвим — беги!';
+  }
+  if (msg) { setHtml('banner2', el.banner, msg); cache.evMsg = 1; }
+  else if (cache.evMsg) { cache.evMsg = 0; cache.banner2 = ''; el.banner.textContent = ''; }
+  // красное затемнение и сердцебиение, когда преследователь близко
+  const danger = Math.max(0, Math.min(1, (28 - nearChaser) / 24));
+  const vg = document.getElementById('vig');
+  if (vg) vg.style.background = `radial-gradient(ellipse at center, rgba(0,0,0,0) ${58 - danger * 30}%, rgba(${Math.round(60 + danger * 140)},0,0,${(0.38 + danger * 0.5).toFixed(2)}) 100%)`;
+  const now = performance.now();
+  if (danger > 0.05 && you.alive && now - lastBeat > 1100 - danger * 650) { lastBeat = now; thump({ f0: 70, f1: 45, dur: 0.14, vol: 0.5 * danger + 0.1 }); }
+  el.speed.style.color = '#fff';
+  el.score.style.display === 'block' && setHtml('score', el.score, `<table><tr><th>Игрок</th><th>Подняты</th><th>Пойман</th></tr>${players.filter((p) => !p.ai).sort((a, b) => b.k - a.k).map((p) => `<tr class="${p.id === myId ? 'me' : ''}"><td>${nameOf(p.id)}</td><td>${p.k}</td><td>${p.d}</td></tr>`).join('')}</table>`);
+  if (buyOpen) { if (roundInfo.phase !== 'buy') closeBuy(); const sig = `${buyCat}|${you.ch}`; if (sig !== lastBuySig) { lastBuySig = sig; renderBuy(); } }
+}
+
 // ===================== Главный цикл =====================
 let last = performance.now();
 function frame(now) {
@@ -2282,7 +2543,7 @@ function frame(now) {
   const py = me ? me.y : 0;
   const pz = me ? me.z : 0;
   const viewPitch = Math.max(-1.55, Math.min(1.55, pitch + punch));
-  const cam = [px, py + (alive ? eye : 0.45), pz];
+  const cam = [px, py + (alive ? (you && you.dn ? 0.4 : eye) : 0.45), pz];
   const basis = camBasis(viewPitch);
   const target = [cam[0] + basis.f[0], cam[1] + basis.f[1], cam[2] + basis.f[2]];
   const fov = isScoped() ? SCOPE_FOV : BASE_FOV;
@@ -2290,19 +2551,23 @@ function frame(now) {
   const view = lookAt(cam, target, [0, 1, 0]);
   const vp = multiply(proj, view);
 
+  renderShadowMap(px, py, pz, basis.f[0], basis.f[2]);
   gl.uniformMatrix4fv(U.vp, false, vp);
   gl.uniform3fv(U.cam, cam);
 
   drawSky(vp, now);
+  gl.uniform1f(U.shadowOn, SM.ok ? 1 : 0);
   drawWorld();
-  for (const [id, p] of shown) if (id !== myId && p.alive) drawShadow(p.x, p.y, p.z, 0.55);
-  for (const [id, p] of shown) if (id !== myId && p.alive) drawPlayer(p);
+  if (!SM.ok) for (const [id, p] of shown) if (id !== myId && p.alive) drawShadow(p.x, p.y, p.z, 0.55);
+  for (const [id, p] of shown) if (id !== myId && p.alive) { if (p.dn) drawDowned(p, now); else drawPlayer(p); }
+  for (const c of shownCh.values()) drawChaser(c, now);
   drawNades();
   drawBooms(now);
   drawEffects(now, cam, basis);
   drawBlood(now);
   drawFires(now);
   drawSmokes(now);
+  gl.uniform1f(U.shadowOn, 0);
   drawViewmodel(proj, now, me ? me.spd : 0);
   updateLabels(vp, cam);
   updateHud();
@@ -2312,6 +2577,7 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // для проверки и отладки
+window.__chasers = () => serverChasers;
 window.__game = {
   get me() { return me; },
   get you() { return you; },
@@ -2319,6 +2585,7 @@ window.__game = {
   get round() { return roundInfo; },
   get buyOpen() { return buyOpen; },
   setLook(y, p) { yaw = y; pitch = p; },
+  get chasers() { return serverChasers; },
   keys,
 };
 </script>
