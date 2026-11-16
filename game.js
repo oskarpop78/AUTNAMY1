@@ -58,6 +58,20 @@ const CHARS = {
 };
 const CHAR_IDS = Object.keys(CHARS);
 const HASTE_MULT = 1.35;
+
+// ---------- режим «Побег» (Evade): за игроками гонятся преследователи ----------
+const EVADE_PREP_MS = 8000;      // приготовиться
+const EVADE_LIVE_MS = 120000;    // сколько нужно продержаться
+const EVADE_END_MS = 6000;       // пауза после раунда
+const BLEED_MS = 25000;          // сколько можно лежать, пока тебя не подняли
+const REVIVE_MS = 2500;          // сколько стоять рядом, чтобы поднять
+const REVIVE_RADIUS = 2.4;
+const CATCH_RADIUS = 0.95;       // на каком расстоянии преследователь ловит
+const INVULN_MS = 3000;          // защита после подъёма
+const CHASER_STUN_MS = 1800;     // преследователь замирает после поимки
+const CHASER_SPEED0 = 0.15;      // скорость в начале (обычный бег игрока 0.17, бхоп быстрее)
+const CHASER_SPEED1 = 0.235;     // скорость в конце раунда
+const MAX_CHASERS = 4;
 const SHIELD_MULT = 0.3;
 const MEDIC_HEAL = 60;
 const DASH_SPEED = 0.48;
@@ -127,7 +141,8 @@ function createGame(opts) {
   const broadcast = opts.broadcast || (() => {});
   const rand = opts.rand || Math.random;
   const startMoney = opts.startMoney || START_MONEY;   // стартовые деньги (в режиме тренировки больше)
-  const botCount = Math.max(0, Math.min(7, opts.bots || 0)); // сколько ботов-противников
+  const EVADE = opts.mode === 'evade';                       // режим «Побег»
+  const botCount = EVADE ? 0 : Math.max(0, Math.min(7, opts.bots || 0)); // сколько ботов-противников
   const botLevel = BOT_LEVELS[opts.botLevel] || BOT_LEVELS[2];
 
   const players = new Map();   // id -> игрок (и настоящие, и мишени)
@@ -135,6 +150,8 @@ function createGame(opts) {
   let phaseEnd = now() + BUY_MS;
   let round = 1;
   let ticks = 0;
+  const chasers = [];          // преследователи (режим «Побег»)
+  let nextChaser = 901;
   const nades = [];            // гранаты в полёте
   const smokes = [];           // дымовые облака
   const fires = [];            // огонь от коктейлей Молотова
@@ -170,6 +187,7 @@ function createGame(opts) {
       weapons: null, ammo: {}, cur: 'pistol',
       reload: null, nextFire: 0, lastShot: 0, clickAt: 0, clicks: 0, altAt: 0, rclicks: 0,
       fireHeld: false, scoped: false, recoil: 0, respawnAt: 0,
+      downed: false, downAt: 0, reviveProg: 0, invulnUntil: 0,
     });
     resetLoadout(p);
     if (ai) { p.ai = newAi(); p.name = BOT_NAMES[(id - 201) % BOT_NAMES.length]; }
@@ -183,7 +201,9 @@ function createGame(opts) {
     };
   }
 
-  if (botCount === 0) {
+  if (EVADE) {
+    // в режиме «Побег» ни мишеней, ни ботов-стрелков нет
+  } else if (botCount === 0) {
     // без ботов стоят мишени для тренировки
     world.MAP.dummies.forEach(([x, z], i) => {
       const d = makePlayer(101 + i, true);
@@ -222,6 +242,7 @@ function createGame(opts) {
     p.nextFire = 0;
     p.altAt = 0;
     p.blindUntil = 0;
+    p.downed = false; p.reviveProg = 0; p.invulnUntil = 0;
     if (p.ai) p.ai = newAi();
   }
 
@@ -255,15 +276,17 @@ function createGame(opts) {
   function startRound(t, fresh) {
     if (fresh) round = 1; else round++;
     phase = 'buy';
-    phaseEnd = t + BUY_MS;
+    phaseEnd = t + (EVADE ? EVADE_PREP_MS : BUY_MS);
     nades.length = 0;
     smokes.length = 0;
     fires.length = 0;
+    chasers.length = 0;
     for (const p of players.values()) {
       if (p.diedThisRound) resetLoadout(p);   // погиб - теряешь оружие, выжил - оставляешь
       refillAmmo(p);
       respawn(p);
     }
+    if (EVADE) clusterHumans();
     spreadBots();
     for (const p of players.values()) if (p.ai) botBuy(p);
     broadcast({ type: 'phase', phase: 'buy', round });
@@ -278,6 +301,11 @@ function createGame(opts) {
       startRound(t, true);        // пришёл первый игрок: начинаем всё с начала
     } else if (phase === 'buy') {
       respawn(p);
+      if (EVADE) placeNewcomer(p);
+    } else if (EVADE && phase === 'live') {
+      respawn(p);                       // в «Побеге» можно присоединиться посреди раунда
+      placeNewcomer(p);
+      p.invulnUntil = t + 4000;
     } else {
       p.alive = false;
       p.inRound = false;
@@ -292,6 +320,7 @@ function createGame(opts) {
 
   // ---------- магазин ----------
   function buy(p, item) {
+    if (EVADE) return say(p, 'В режиме «Побег» магазина нет: только выбор персонажа');
     if (!p.alive) return say(p, 'Ты мёртв');
     if (phase !== 'buy') return say(p, 'Покупать можно только в начале раунда');
 
@@ -341,6 +370,20 @@ function createGame(opts) {
     if (phase !== 'live') return say(p, 'Способность работает только во время раунда');
     if (t < p.abReadyAt) return say(p, `${CHARS[p.char].ab}: ещё ${Math.ceil((p.abReadyAt - t) / 1000)} сек`);
     const c = CHARS[p.char];
+    if (EVADE && p.downed) return;
+    if (EVADE && p.char === 'medic') {          // Медик мгновенно поднимает ближайшего лежащего
+      let near = null; let nd = 9;
+      for (const q of humans()) {
+        if (q === p || !q.alive || !q.downed) continue;
+        const d = Math.hypot(q.x - p.x, q.z - p.z);
+        if (d < nd) { nd = d; near = q; }
+      }
+      if (!near) return say(p, 'Рядом (до 9 м) некого поднимать');
+      p.abReadyAt = t + c.cd;
+      p.abUntil = t + c.dur;
+      revive(near, p, t);
+      return;
+    }
     if (p.char === 'medic' && p.hp >= c.hp) return say(p, 'Здоровье уже полное');
     p.abReadyAt = t + c.cd;
     p.abUntil = t + c.dur;
@@ -830,6 +873,198 @@ function createGame(opts) {
     keys.j = t < ai.jumpUntil;
   }
 
+  // ---------- режим «Побег» ----------
+  // все игроки появляются рядом друг с другом
+  // свободное место рядом с точкой base
+  function spotNear(base, i) {
+    for (let k = 0; k < 60; k++) {
+      const ang = rand() * Math.PI * 2; const r = 1.2 + rand() * 4;
+      const cx = base.x + Math.cos(ang) * r; const cz = base.z + Math.sin(ang) * r;
+      if (Math.abs(cx) > world.BOUNDS - 1 || Math.abs(cz) > world.BOUNDS - 1) continue;
+      if (world.BOXES.some((bx) => Math.abs(cx - bx.x) < bx.w / 2 + 0.7 && Math.abs(cz - bx.z) < bx.d / 2 + 0.7)) continue;
+      return { x: cx, z: cz };
+    }
+    return { x: base.x + ((i || 1) % 3) * 0.9, z: base.z + Math.floor((i || 1) / 3) * 0.9 };
+  }
+
+  function clusterHumans() {
+    const hs = humans();
+    if (!hs.length) return;
+    const base = world.createPlayer(0);
+    hs.forEach((h, i) => {
+      const sp = i === 0 ? base : spotNear(base, i);
+      h.x = sp.x; h.z = sp.z; h.y = 0;
+    });
+  }
+
+  // новичок встаёт рядом с кем-то из игроков
+  function placeNewcomer(p) {
+    const other = humans().find((h) => h !== p && h.alive && h.inRound);
+    if (!other) return;
+    const sp = spotNear(other, 1);
+    p.x = sp.x; p.z = sp.z; p.y = 0;
+  }
+
+  // место появления преследователя: как можно дальше от живых игроков
+  function farSpawn() {
+    const hs = humans().filter((h) => h.alive && h.inRound);
+    let best = null; let bd = -1;
+    for (let i = 0; i < 30; i++) {
+      const sp = world.createPlayer(0);
+      const d = hs.length ? Math.min(...hs.map((h) => Math.hypot(h.x - sp.x, h.z - sp.z))) : 99;
+      if (d > bd) { bd = d; best = sp; }
+      if (d > 45) break;
+    }
+    return best;
+  }
+
+  function spawnChaser(t) {
+    const sp = farSpawn();
+    const c = world.createPlayer(nextChaser);
+    c.id = nextChaser++;
+    if (sp) { c.x = sp.x; c.z = sp.z; }
+    Object.assign(c, { speedMul: 1, stunUntil: t + 1500, targetId: null, path: null, pathAt: 0, pi: 0, lx: c.x, lz: c.z, stuck: 0, jumpUntil: 0 });
+    chasers.push(c);
+    broadcast({ type: 'chaser', n: chasers.length });
+  }
+
+  const healthyHumans = () => humans().filter((p) => p.alive && p.inRound && !p.downed);
+
+  function wantChasers(elapsed, nHumans) {
+    let n = 1 + Math.floor(Math.max(0, nHumans - 1) / 3);
+    if (elapsed > EVADE_LIVE_MS * 0.4) n++;
+    if (elapsed > EVADE_LIVE_MS * 0.75) n++;
+    return Math.min(MAX_CHASERS, n);
+  }
+
+  function chaserThink(c, t) {
+    const keys = { f: false, b: false, l: false, r: false, j: false };
+    c.keys = keys;
+    if (t < c.stunUntil) return;
+    if ((ticks + c.id) % 6 === 0 || c.targetId === null) {
+      let best = null; let bd = Infinity;
+      for (const q of healthyHumans()) {
+        if (isCloaked(q, t)) continue;
+        const d = Math.hypot(q.x - c.x, q.z - c.z);
+        if (d < bd) { bd = d; best = q; }
+      }
+      const id = best ? best.id : null;
+      if (id !== c.targetId) { c.targetId = id; c.path = null; }
+    }
+    const target = c.targetId !== null ? players.get(c.targetId) : null;
+    if (!target || !target.alive || target.downed || isCloaked(target, t)) { c.targetId = null; return; }
+
+    let wx = 0; let wz = 0;
+    const a = { x: c.x, y: 1.0, z: c.z }; const b = { x: target.x, y: 1.0, z: target.z };
+    const dist = Math.hypot(target.x - c.x, target.z - c.z);
+    if (dist < 30 && !segBlocked(a, b)) {
+      wx = (target.x - c.x) / (dist || 1); wz = (target.z - c.z) / (dist || 1);   // видим - бежим прямо
+      c.path = null;
+    } else {
+      if (!c.path || t > c.pathAt) {
+        c.path = nav.findPath(c.x, c.z, target.x, target.z);
+        c.pathAt = t + 600 + rand() * 300;
+        c.pi = 0;
+      }
+      if (c.path) {
+        while (c.pi < c.path.length - 1 && Math.hypot(c.path[c.pi].x - c.x, c.path[c.pi].z - c.z) < 0.8) c.pi++;
+        const wp = c.path[c.pi];
+        const ddx = wp.x - c.x; const ddz = wp.z - c.z; const dd = Math.hypot(ddx, ddz);
+        if (dd > 0.3) { wx = ddx / dd; wz = ddz / dd; }
+      }
+    }
+    if (wx || wz) {
+      c.yaw += clamp(angDiff(c.yaw, Math.atan2(-wx, -wz)), -0.3, 0.3);
+      keys.f = true;
+    }
+    const moved = Math.hypot(c.x - c.lx, c.z - c.lz);
+    c.lx = c.x; c.lz = c.z;
+    if (keys.f && moved < 0.02) c.stuck++; else c.stuck = Math.max(0, c.stuck - 1);
+    if (c.stuck > 4) c.jumpUntil = t + 400;
+    if (c.stuck > 12) { c.path = null; c.pathAt = 0; c.stuck = 0; }
+    keys.j = t < c.jumpUntil;
+  }
+
+  function catchPlayer(q, c, t) {
+    q.downed = true; q.downAt = t; q.reviveProg = 0;
+    q.vx = 0; q.vz = 0;
+    q.deaths++;
+    c.stunUntil = t + CHASER_STUN_MS;
+    c.targetId = null;
+    send(q.id, { type: 'hurt', dmg: 40 });
+    broadcast({ type: 'caught', id: q.id });
+  }
+
+  function revive(p, helper, t) {
+    p.downed = false; p.reviveProg = 0;
+    p.invulnUntil = t + INVULN_MS;
+    if (helper) { helper.kills++; say(helper, `Ты поднял: ${label(p)}`); }
+    say(p, 'Тебя подняли! Беги!');
+    broadcast({ type: 'revived', id: p.id, by: helper ? helper.id : 0 });
+  }
+
+  function evadeStep(t) {
+    const dt = 1000 / 30;
+    const hs = humans().filter((p) => p.inRound);
+    for (const p of hs) {                      // лежащие: ждут помощи или «истекают»
+      if (!p.alive || !p.downed) continue;
+      if (t - p.downAt > BLEED_MS) {
+        p.downed = false; p.alive = false; p.diedThisRound = true;
+        broadcast({ type: 'lost', id: p.id });
+        continue;
+      }
+      let helper = null;
+      for (const q of hs) {
+        if (q !== p && q.alive && !q.downed && Math.hypot(q.x - p.x, q.z - p.z) < REVIVE_RADIUS && Math.abs(q.y - p.y) < 1.8) { helper = q; break; }
+      }
+      if (helper) {
+        p.reviveProg += dt / REVIVE_MS;
+        if (p.reviveProg >= 1) revive(p, helper, t);
+      } else p.reviveProg = Math.max(0, p.reviveProg - dt / (REVIVE_MS * 2));
+    }
+    if (phase !== 'live') return;
+    const elapsed = t - (phaseEnd - EVADE_LIVE_MS);
+    while (chasers.length < wantChasers(elapsed, hs.length)) spawnChaser(t);
+    const speed = CHASER_SPEED0 + (CHASER_SPEED1 - CHASER_SPEED0) * clamp(elapsed / EVADE_LIVE_MS, 0, 1);
+    for (const c of chasers) {
+      chaserThink(c, t);
+      c.speedMul = speed / world.SPEED;
+      world.stepPlayer(c);
+      if (t < c.stunUntil) continue;
+      for (const q of hs) {
+        if (!q.alive || q.downed || t < q.invulnUntil) continue;
+        if (q.char === 'tank' && abActive(q, t)) continue;            // щит Танка: поймать нельзя
+        if (Math.hypot(q.x - c.x, q.z - c.z) < CATCH_RADIUS && Math.abs(q.y - c.y) < 1.7) catchPlayer(q, c, t);
+      }
+    }
+  }
+
+  function evadeRoundStep(t) {
+    if (phase === 'buy') {
+      if (t >= phaseEnd) {
+        phase = 'live';
+        phaseEnd = t + EVADE_LIVE_MS;
+        broadcast({ type: 'phase', phase: 'live', round });
+      }
+    } else if (phase === 'live') {
+      const hs = humans().filter((p) => p.inRound);
+      const free = hs.filter((p) => p.alive && !p.downed);
+      if (hs.length && free.length === 0) evadeEnd(t, false);
+      else if (t >= phaseEnd) evadeEnd(t, true);
+    } else if (phase === 'end') {
+      if (t >= phaseEnd) startRound(t, false);
+    }
+  }
+
+  function evadeEnd(t, timeUp) {
+    phase = 'end';
+    phaseEnd = t + EVADE_END_MS;
+    const hs = humans().filter((p) => p.inRound);
+    const free = hs.filter((p) => p.alive);
+    const text = timeUp ? `Время вышло! Выжили: ${free.length} из ${hs.length}` : 'Всех поймали! Раунд проигран';
+    broadcast({ type: 'roundEnd', winner: null, text, win: timeUp ? 1 : 0 });
+  }
+
   // ---------- раунды ----------
   function endRound(t, winner) {
     phase = 'end';
@@ -843,6 +1078,7 @@ function createGame(opts) {
   }
 
   function roundStep(t) {
+    if (EVADE) { evadeRoundStep(t); return; }
     if (phase === 'buy') {
       if (t >= phaseEnd) {
         phase = 'live';
@@ -869,19 +1105,21 @@ function createGame(opts) {
   function tick() {
     const t = now();
     ticks++;
+    if (EVADE && humans().length === 0) { phase = 'buy'; phaseEnd = t + EVADE_PREP_MS; chasers.length = 0; return; }   // людей нет - пауза
     if (botCount > 0 && humans().length === 0) { phaseEnd = t + BUY_MS; return; }   // людей нет - игра на паузе
     for (const p of players.values()) {
       if (p.dummy) {
         if (!p.alive && t >= p.respawnAt) { p.hp = CHARS[p.char].hp; p.alive = true; }
         continue;
       }
-      if (!p.alive) p.keys = NO_KEYS;
+      if (!p.alive || (EVADE && p.downed)) p.keys = NO_KEYS;
       else if (p.ai) botThink(p, t);
-      p.speedMul = (p.cur === 'knife' ? KNIFE_SPEED : 1) * CHARS[p.char].speed * (p.char === 'soldier' && abActive(p, t) ? HASTE_MULT : 1);
+      p.speedMul = (!EVADE && p.cur === 'knife' ? KNIFE_SPEED : 1) * CHARS[p.char].speed * (p.char === 'soldier' && abActive(p, t) ? HASTE_MULT : 1);
       if (p.dash) { if (abActive(p, t) && p.alive) { p.vx = p.dash.x; p.vz = p.dash.z; } else p.dash = null; }
       world.stepPlayer(p);
-      if (p.alive) combatStep(p, t);
+      if (p.alive && !EVADE) combatStep(p, t);
     }
+    if (EVADE) evadeStep(t);
     stepNades(t);
     stepFires(t);
     roundStep(t);
@@ -944,7 +1182,7 @@ function createGame(opts) {
     const weapons = {};
     for (const [wid, w] of Object.entries(WEAPONS)) weapons[wid] = { name: w.name, auto: w.auto, scope: !!w.scope, mag: w.mag, nade: !!w.nade, melee: !!w.melee, max: w.max || 0 };
     const m = world.MAP;
-    return { type: 'hello', id, bounds: world.BOUNDS, eye: world.EYE, boxes: world.BOXES, shop: shopForClient(), chars: CHARS, weapons,
+    return { type: 'hello', mode: EVADE ? 'evade' : 'classic', id, bounds: world.BOUNDS, eye: world.EYE, boxes: world.BOXES, shop: shopForClient(), chars: CHARS, weapons,
       map: { id: m.id, name: m.name, floor: m.floor, sky: m.sky, wall: m.wall } };
   }
 
@@ -956,6 +1194,7 @@ function createGame(opts) {
       spd: Math.round((Math.hypot(p.vx, p.vz) / world.TICK) * 10) / 10,
       hp: p.hp, armor: Math.round(p.armor), alive: p.alive ? 1 : 0,
       ch: p.char, w: p.cur, k: p.kills, d: p.deaths, bot: p.dummy ? 1 : 0, ai: p.ai ? 1 : 0, name: p.ai ? p.name : '',
+      dn: p.downed ? 1 : 0, rv: r2(p.reviveProg || 0),
     }));
     const me = players.get(forId);
     const a = curAmmo(me);
@@ -973,7 +1212,10 @@ function createGame(opts) {
         blind: Math.max(0, r2((me.blindUntil - t) / 1000)),
         ch: me.char, maxHp: CHARS[me.char].hp,
         abLeft: Math.max(0, Math.ceil((me.abReadyAt - t) / 1000)), abOn: abActive(me, t) ? 1 : 0, cloak: isCloaked(me, t) ? 1 : 0,
+        dn: me.downed ? 1 : 0, rv: r2(me.reviveProg || 0), bleed: me.downed ? Math.max(0, Math.ceil((BLEED_MS - (t - me.downAt)) / 1000)) : 0,
+        inv: t < me.invulnUntil ? 1 : 0,
       },
+      chasers: chasers.map((c) => ({ id: c.id, x: r2(c.x), y: r2(c.y), z: r2(c.z), yaw: r2(c.yaw), spd: Math.round((Math.hypot(c.vx, c.vz) / world.TICK) * 10) / 10, st: t < c.stunUntil ? 1 : 0 })),
       nades: nades.map((n) => ({ k: n.kind, x: r2(n.x), y: r2(n.y), z: r2(n.z) })),
       fires: fires.map((f) => ({ x: r2(f.x), y: r2(f.y), z: r2(f.z), r: f.r, left: Math.max(0, Math.round((f.until - ticks) / 30)) })),
       smokes: smokes.map((m) => ({ x: r2(m.x), y: r2(m.y), z: r2(m.z), r: m.r, left: Math.max(0, Math.round((m.until - ticks) / 30)) })),
